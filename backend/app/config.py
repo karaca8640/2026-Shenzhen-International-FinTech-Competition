@@ -41,7 +41,7 @@ def _asyncpg_query(url: str) -> str:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=(str(BACKEND_ROOT.parent / ".env"), ".env"), extra="ignore")
 
     # "dev" enables the dev-token endpoint, in-process Redis fallback and
     # permissive defaults. "prod" requires real secrets, Redis and Postgres.

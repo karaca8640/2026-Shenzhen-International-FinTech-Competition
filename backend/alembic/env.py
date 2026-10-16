@@ -2,6 +2,7 @@
 
 import asyncio
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
 from app.config import get_settings
 from app.db.models import Base
+from app.refundpath import models as refundpath_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
@@ -18,7 +20,10 @@ target_metadata = Base.metadata
 
 
 def _url() -> str:
-    return get_settings().async_database_url
+    url = get_settings().async_database_url
+    if url.startswith("sqlite") and ":memory:" not in url:
+        Path(url.split(":///", 1)[1]).parent.mkdir(parents=True, exist_ok=True)
+    return url
 
 
 def run_migrations_offline() -> None:

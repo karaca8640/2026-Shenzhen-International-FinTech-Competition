@@ -3,6 +3,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-demo/
+.tmp/
+frontend/test-results/
+frontend/playwright-report/
 .env
 backend/var/
 frontend/node_modules/

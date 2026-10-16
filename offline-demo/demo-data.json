@@ -1,0 +1,116 @@
+{
+  "registry": {
+    "version": "au-2026-10-14.2",
+    "jurisdiction": "AU",
+    "checked_at": "2026-10-14",
+    "review_due": "2027-01-12",
+    "sources": [
+      {
+        "id": "esos",
+        "title": "Education Services for Overseas Students Act 2000",
+        "url": "https://www.legislation.gov.au/C2004A00757/latest",
+        "snapshot_url": "https://www.legislation.gov.au/C2004A00757/2025-12-05/2025-12-05/text/original/epub/OEBPS/document_1/document_1.html",
+        "version": "Compilation 45",
+        "effective_from": "2025-12-05",
+        "checked_at": "2026-10-14",
+        "section": "s 5 default day; ss 47A, 47D(5), 47E(1)-(3)",
+        "summary": "For a visa refusal that caused a qualifying student default, s 47E uses the default day. For failure to start, that day is the agreed starting day, subject to s 47A conditions. Other agreement claims have a different trigger under s 47D(4)."
+      },
+      {
+        "id": "instrument2024",
+        "title": "Calculation of Refund Instrument 2024",
+        "url": "https://www.legislation.gov.au/F2024L01231/latest",
+        "snapshot_url": "https://www.legislation.gov.au/F2024L01231/asmade/2024-09-30/text/original/epub/OEBPS/document_1/document_1.html",
+        "version": "F2024L01231",
+        "effective_from": "2024-10-01",
+        "checked_at": "2026-10-14",
+        "section": "s 2; s 10(1)-(3); Schedule 1",
+        "summary": "For visa refusal causing failure to start, course fees include tuition and non-tuition fees received by the provider. The deduction is the lesser of 5% of course fees received before default and AUD 500. Schedule 1 repeals the 2014 specification."
+      },
+      {
+        "id": "tps-students",
+        "title": "Department of Education · International students / TPS",
+        "url": "https://www.education.gov.au/tps/international-students",
+        "version": "Web guidance snapshot",
+        "effective_from": null,
+        "checked_at": "2026-10-14",
+        "section": "Your education provider’s default obligations",
+        "summary": "TPS may assist when a provider fails to meet its obligations after a default. Statutory conditions must be checked for the individual case."
+      },
+      {
+        "id": "tps-providers",
+        "title": "Department of Education · International providers / TPS",
+        "url": "https://www.education.gov.au/tps/international-providers-tps",
+        "version": "Web guidance snapshot",
+        "effective_from": null,
+        "checked_at": "2026-10-14",
+        "section": "Student default obligations",
+        "summary": "Provider guidance describes default obligations. Its written-agreement paragraph still refers to the repealed 2014 specification; RefundPath instead uses the 2024 instrument."
+      },
+      {
+        "id": "complaints",
+        "title": "Commonwealth Ombudsman · International student complaints",
+        "url": "https://www.ombudsman.gov.au/complaints/international-student-complaints",
+        "version": "Web guidance snapshot",
+        "effective_from": null,
+        "checked_at": "2026-10-14",
+        "section": "What we can do / other complaint services",
+        "summary": "Higher education complaints may go to the National Student Ombudsman; private VET to the Commonwealth Ombudsman’s Overseas Student team; public VET to a state or territory ombudsman. The student must confirm jurisdiction."
+      }
+    ],
+    "rules": [
+      {
+        "id": "visa-no-start-amount",
+        "section": "Instrument 2024 s 10(1)-(3)",
+        "sources": [
+          "esos",
+          "instrument2024"
+        ],
+        "effective_from": "2024-10-01",
+        "checked_at": "2026-10-14",
+        "deduction_percent": "0.05",
+        "deduction_cap_aud": "500.00"
+      },
+      {
+        "id": "visa-default-deadline",
+        "section": "ESOS Act s 47E(3), s 5 and s 47A(1)(a)",
+        "sources": [
+          "esos"
+        ],
+        "effective_from": "2025-12-05",
+        "checked_at": "2026-10-14",
+        "weeks_after_default": 4
+      }
+    ],
+    "complaint_routes": [
+      {
+        "provider_types": [
+          "private",
+          "public"
+        ],
+        "education_level": "higher education",
+        "label": "National Student Ombudsman",
+        "source_id": "complaints",
+        "checked_at": "2026-10-14"
+      },
+      {
+        "provider_types": [
+          "private"
+        ],
+        "education_level": "vet",
+        "label": "Commonwealth Ombudsman · Overseas Student team",
+        "source_id": "complaints",
+        "checked_at": "2026-10-14"
+      },
+      {
+        "provider_types": [
+          "public"
+        ],
+        "education_level": "vet",
+        "label": "State or territory ombudsman · confirm provider jurisdiction",
+        "source_id": "complaints",
+        "checked_at": "2026-10-14"
+      }
+    ]
+  }
+}

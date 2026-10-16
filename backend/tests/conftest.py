@@ -78,7 +78,7 @@ async def db_session(engine) -> AsyncSession:
 async def client(engine):
     from sse_starlette.sse import AppStatus
 
-    from app.main import app
+    from app.legacy_main import app
 
     # sse-starlette caches an exit Event bound to the first event loop it saw.
     AppStatus.should_exit_event = None

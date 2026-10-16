@@ -16,6 +16,7 @@ export interface StepEvent {
     | "trace"
     | "error";
   node: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Retained upstream tool events have heterogeneous payloads.
   payload: Record<string, any>;
   created_at: string;
 }

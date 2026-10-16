@@ -1,567 +1,128 @@
-import hmac
-import json
+"""RefundPath's active API. The upstream agent stays isolated in legacy_main."""
+import asyncio
 import logging
-import random
-from contextlib import asynccontextmanager
-from datetime import datetime
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
-from sqlalchemy import func, select, text
-from sse_starlette.sse import EventSourceResponse
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from app import redis as shared
-from app import tracing
-from app.agent.llm import primary_model_name
-from app.agent.runner import (
-    ConversationNotFound,
-    create_conversation,
-    load_owned_conversation,
-    new_conversation_id,
-    run_agent_turn,
-)
-from app.auth import (
-    ROLE_ADMIN,
-    ROLE_CUSTOMER,
-    Principal,
-    bearer_token,
-    mint_token,
-    principal_from_request,
-    require_admin,
-    require_customer,
-)
-from app.config import get_settings
 from app.db import session as db
-from app.db.models import Conversation, Customer, Message, Order, ReasoningEvent, Refund
-from app.db.seed import seed_if_empty
-from app.demo import order_out
-from app.demo import router as demo_router
-from app.events import broadcaster
-from app.observability import (
-    REJECTIONS,
-    SSE_STREAMS,
-    RequestContextMiddleware,
-    configure_logging,
-    configure_sentry,
-    customer_id_var,
-    log_event,
-)
-from app.schemas import (
-    AdminStats,
-    ChatRequest,
-    ConversationDetail,
-    ConversationSummary,
-    MessageOut,
-    OrderOut,
-    ReasoningEventOut,
-)
-
-settings = get_settings()
-logger = logging.getLogger("app")
-
-STREAM_ERROR_MESSAGE = (
-    "Sorry — something went wrong on our side while handling that. "
-    "Please try again in a moment."
-)
+from app.refundpath.api import purge_expired, router
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    configure_logging()
-    configure_sentry()
-    tracing.configure()
-    if settings.seed_on_startup:
-        await seed_if_empty(create_tables=True)
-    log_event(logger, "startup", env=settings.env, llm_provider=settings.llm_provider)
-    yield
-    tracing.flush()
-    await shared.close_redis()
-    await db.dispose()
+    logging.getLogger("pypdf").disabled = True
+    await db.init_db()
+    await purge_expired()
+
+    async def retention():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await purge_expired()
+            except Exception as exc:
+                logging.getLogger("refundpath").error("Retention failed (%s)", type(exc).__name__)
+
+    cleanup = asyncio.create_task(retention())
+    try:
+        yield
+    finally:
+        cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup
+        await db.dispose()
 
 
-app = FastAPI(title="ACME Refund Support Agent", lifespan=lifespan)
+class BodyLimit:
+    """Bound multipart and chunked request bodies before any parser sees them."""
+    def __init__(self, app, limit=5 * 1024 * 1024 + 65536):
+        self.app, self.limit = app, limit
 
-# In Docker/k8s the SPA is same-origin (nginx/ingress route /api), so CORS is
-# only needed when embedding the widget on another origin — allowlist those.
-if settings.cors_origin_list:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-        # The UI reads these on 429/503 and for support references.
-        expose_headers=["Retry-After", "X-Request-ID"],
-        max_age=3600,
-    )
-app.add_middleware(RequestContextMiddleware, max_body_bytes=settings.max_request_bytes)
-app.include_router(demo_router)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        chunks, length = [], 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            length += len(message.get("body", b""))
+            if length > self.limit:
+                return await JSONResponse({"detail": "Request exceeds the 5 MB upload limit."}, status_code=413)(scope, receive, send)
+            chunks.append(message)
+            if not message.get("more_body"):
+                break
+        index = 0
+
+        async def replay():
+            nonlocal index
+            if index < len(chunks):
+                message = chunks[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+app = FastAPI(title="RefundPath · Australia sandbox", version="1.0.0", lifespan=lifespan)
+app.include_router(router)
+app.add_middleware(BodyLimit)
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+
+@app.middleware("http")
+async def privacy_headers(request: Request, call_next):
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        allowed = {str(request.base_url).rstrip("/"), "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"}
+        if origin and origin not in allowed:
+            return JSONResponse({"detail": "Cross-origin changes are not permitted."}, status_code=403)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        # Catch before ServerErrorMiddleware re-raises and uvicorn prints private SQL parameters.
+        logging.getLogger("refundpath").error("Request failed (%s)", type(exc).__name__)
+        response = JSONResponse({"detail": "The request could not be completed. Please retry."}, status_code=500)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if not request.url.path.startswith("/api"):
+        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_request, _exc):
+    # Pydantic's default response includes user inputs, including private data.
+    return JSONResponse({"detail": "Check the required fields, formats and allowed values."}, status_code=422)
 
 
 @app.exception_handler(Exception)
-async def _unhandled(_request: Request, exc: Exception):
-    log_event(
-        logger,
-        "unhandled error",
-        level=logging.ERROR,
-        error_type=type(exc).__name__,
-        error=str(exc)[:500],
-    )
-    return JSONResponse(status_code=500, content={"detail": "internal error"})
-
-
-# ---------------------------------------------------------------------------
-# Health & metrics
-# ---------------------------------------------------------------------------
+async def unhandled(_request, exc):
+    logging.getLogger("refundpath").error("Request failed (%s)", type(exc).__name__)
+    return JSONResponse({"detail": "The request could not be completed. Please retry."}, status_code=500)
 
 
 @app.get("/api/health")
 @app.get("/api/health/live")
-async def health() -> dict:
-    return {
-        "status": "ok",
-        "llm_provider": settings.llm_provider,
-        "llm_key_configured": settings.has_llm_key,
-    }
-
-
 @app.get("/api/health/ready")
-async def ready() -> Response:
-    checks = {}
-    try:
-        async with db.SessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-        checks["db"] = "ok"
-    except Exception as exc:  # pragma: no cover - exercised in k8s
-        checks["db"] = f"error: {type(exc).__name__}"
-    try:
-        await shared.get_redis().ping()
-        checks["redis"] = "ok"
-    except Exception as exc:  # pragma: no cover
-        checks["redis"] = f"error: {type(exc).__name__}"
-    ok = all(v == "ok" for v in checks.values())
-    return JSONResponse(status_code=200 if ok else 503, content={"ready": ok, **checks})
+async def health():
+    return {"status": "ok", "product": "RefundPath", "sandbox": True, "external_submission": False}
 
 
-@app.get("/metrics", include_in_schema=False)
-async def metrics(request: Request) -> Response:
-    if settings.metrics_token:
-        given = bearer_token(request) or ""
-        if not hmac.compare_digest(given.encode(), settings.metrics_token.encode()):
-            raise HTTPException(status_code=401, detail="metrics token required")
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-
-@app.get("/api/meta")
-async def meta() -> dict:
-    """Public, non-sensitive facts the UI adapts to (sign-in flow, model)."""
-    scripted = settings.llm_provider == "fake"
-    return {
-        "auth_mode": settings.auth_mode,
-        "model": "scripted" if scripted else settings.llm_provider,
-        "model_name": None if scripted else primary_model_name(),
-        "demo": {
-            "session_ttl_s": settings.demo_token_ttl_s,
-            "data_ttl_hours": settings.demo_data_ttl_hours,
-            # Chats are archived for review when a sandbox is purged (maintenance/archive.py).
-            "transcript_retention_days": settings.retention_days,
-        }
-        if settings.is_demo
-        else None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Dev-only token minting (AUTH_MODE=dev). In production this route 404s and
-# tokens are issued by the host site.
-# ---------------------------------------------------------------------------
-
-
-class DevTokenRequest(BaseModel):
-    customer_id: str | None = None
-    admin: bool = False
-
-
-@app.post("/api/dev/token")
-async def dev_token(req: DevTokenRequest) -> dict:
-    if settings.auth_mode != "dev" or settings.env == "prod":
-        raise HTTPException(status_code=404, detail="Not Found")
-    if req.admin:
-        return {"token": mint_token("dev-admin", ROLE_ADMIN), "role": ROLE_ADMIN}
-    if not req.customer_id:
-        raise HTTPException(status_code=400, detail="customer_id is required")
-    async with db.SessionLocal() as session:
-        if await session.get(Customer, req.customer_id) is None:
-            raise HTTPException(status_code=404, detail="unknown customer")
-    return {"token": mint_token(req.customer_id, ROLE_CUSTOMER), "role": ROLE_CUSTOMER}
-
-
-@app.get("/api/dev/customers")
-async def dev_customers() -> list[dict]:
-    """Customer picker for the local demo UI."""
-    if settings.auth_mode != "dev" or settings.env == "prod":
-        raise HTTPException(status_code=404, detail="Not Found")
-    async with db.SessionLocal() as session:
-        rows = (await session.scalars(select(Customer).order_by(Customer.id).limit(20))).all()
-    return [{"id": c.id, "name": c.name, "email": c.email} for c in rows]
-
-
-# ---------------------------------------------------------------------------
-# Customer chat
-# ---------------------------------------------------------------------------
-
-
-def _rate_limit_key(request: Request) -> str:
-    principal = principal_from_request(request)
-    if principal is not None:
-        return f"sub:{principal.sub}"
-    # Uvicorn runs with --proxy-headers, so this is the real client IP when
-    # the ingress/nginx is a trusted forwarder.
-    return f"ip:{request.client.host if request.client else 'unknown'}"
-
-
-async def enforce_chat_rate_limit(request: Request) -> None:
-    if principal_from_request(request) is None:
-        # Missing/invalid token: let the auth dependency answer 401. Counting
-        # these per IP would let one bad client behind a shared NAT/proxy
-        # exhaust the limit for everyone else on that IP.
-        return
-    allowed, reset_in = await shared.hit_rate_limit(
-        f"chat:{_rate_limit_key(request)}", settings.chat_rate_limit
-    )
-    if not allowed:
-        REJECTIONS.labels("rate_limited").inc()
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.chat_rate_limit}",
-            headers={"Retry-After": str(reset_in)},
-        )
-
-
-@app.post("/api/chat", dependencies=[Depends(enforce_chat_rate_limit)])
-async def chat(req: ChatRequest, principal: Principal = Depends(require_customer)):
-    customer_id_var.set(principal.sub)
-    if not req.message.strip():
-        raise HTTPException(status_code=400, detail="message must not be empty")
-
-    # Guardrail 1: per-message length cap.
-    if len(req.message) > settings.max_message_chars:
-        REJECTIONS.labels("too_long").inc()
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"message is too long ({len(req.message)} chars); the limit is "
-                f"{settings.max_message_chars}."
-            ),
-        )
-
-    # Ownership: a client may only continue a conversation it owns. Unknown and
-    # foreign ids are both 404 so they can't be probed.
-    if req.conversation_id:
-        try:
-            await load_owned_conversation(principal.sub, req.conversation_id)
-        except ConversationNotFound:
-            raise HTTPException(status_code=404, detail="conversation not found") from None
-
-        # Guardrail 2: per-conversation turn cap. Counted before the SSE opens
-        # so the client gets a real HTTP status, not a half-stream.
-        async with db.SessionLocal() as session:
-            existing = (
-                await session.scalar(
-                    select(func.count(Message.id)).where(
-                        Message.conversation_id == req.conversation_id
-                    )
-                )
-                or 0
-            )
-        if existing >= settings.max_conversation_turns:
-            REJECTIONS.labels("turn_cap").inc()
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"this conversation has reached its message limit "
-                    f"({settings.max_conversation_turns}). Please start a new chat."
-                ),
-            )
-        cid = req.conversation_id
-        is_new = False
-    else:
-        cid = new_conversation_id()
-        is_new = True
-
-    # One turn at a time per conversation (across all pods).
-    lock_ttl = settings.turn_timeout_s + 30
-    lock = await shared.acquire_turn_lock(cid, lock_ttl)
-    if lock is None:
-        REJECTIONS.labels("turn_in_progress").inc()
-        raise HTTPException(
-            status_code=409, detail="a reply is still being generated for this conversation"
-        )
-
-    # Global back-pressure: shed load before the LLM provider starts 429ing.
-    slot = await shared.acquire_turn_slot(settings.max_concurrent_turns, lock_ttl)
-    if slot is None:
-        await shared.release_turn_lock(cid, lock)
-        REJECTIONS.labels("overloaded").inc()
-        raise HTTPException(
-            status_code=503,
-            detail="We're experiencing high demand. Please try again shortly.",
-            # Jittered so shed clients don't all come back in lockstep.
-            headers={"Retry-After": str(random.randint(5, 15))},
-        )
-
-    if is_new:
-        await create_conversation(principal.sub, cid)
-
-    async def event_stream():
-        SSE_STREAMS.labels("chat").inc()
-        try:
-            async for event in run_agent_turn(principal.sub, cid, req.message):
-                yield {"data": json.dumps(event)}
-        except Exception as exc:
-            # Headers are already sent, so an exception here would tear the
-            # connection. End the stream cleanly with a generic error instead.
-            log_event(
-                logger,
-                "chat stream failed",
-                level=logging.ERROR,
-                error_type=type(exc).__name__,
-                error=str(exc)[:500],
-            )
-            yield {"data": json.dumps({"kind": "error", "message": STREAM_ERROR_MESSAGE})}
-        finally:
-            SSE_STREAMS.labels("chat").dec()
-            await shared.release_turn_slot(slot)
-            await shared.release_turn_lock(cid, lock)
-
-    return EventSourceResponse(event_stream(), ping=15)
-
-
-def _messages_out(messages) -> list[MessageOut]:
-    return [
-        MessageOut(id=m.id, role=m.role, content=m.content, created_at=m.created_at)
-        for m in messages
-    ]
-
-
-@app.get("/api/me/conversations", response_model=list[ConversationSummary])
-async def my_conversations(
-    principal: Principal = Depends(require_customer),
-    limit: int = Query(20, ge=1, le=100),
-    before: datetime | None = None,
-) -> list[ConversationSummary]:
-    return await _conversation_summaries(limit, before, customer_id=principal.sub)
-
-
-@app.get("/api/me/conversations/{conversation_id}", response_model=ConversationDetail)
-async def my_conversation(
-    conversation_id: str, principal: Principal = Depends(require_customer)
-) -> ConversationDetail:
-    try:
-        convo = await load_owned_conversation(principal.sub, conversation_id)
-    except ConversationNotFound:
-        raise HTTPException(status_code=404, detail="conversation not found") from None
-    async with db.SessionLocal() as session:
-        messages = (
-            await session.scalars(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.id)
-            )
-        ).all()
-    return ConversationDetail(
-        id=convo.id,
-        customer_id=convo.customer_id,
-        customer_name=None,
-        messages=_messages_out(messages),
-        events=[],
-    )
-
-
-@app.get("/api/me/orders", response_model=list[OrderOut])
-async def my_orders(principal: Principal = Depends(require_customer)) -> list[OrderOut]:
-    async with db.SessionLocal() as session:
-        orders = (
-            await session.scalars(
-                select(Order)
-                .where(Order.customer_id == principal.sub)
-                .order_by(Order.id)
-                .limit(100)
-            )
-        ).all()
-    return [order_out(o) for o in orders]
-
-
-# ---------------------------------------------------------------------------
-# Admin (requires role=admin). A scoped admin token (the public demo's) only
-# sees its own customer's data; foreign ids are 404 so they can't be probed.
-# ---------------------------------------------------------------------------
-
-
-async def _conversation_summaries(
-    limit: int, before: datetime | None, customer_id: str | None = None
-) -> list[ConversationSummary]:
-    msg_count = (
-        select(func.count(Message.id))
-        .where(Message.conversation_id == Conversation.id)
-        .correlate(Conversation)
-        .scalar_subquery()
-    )
-    last_message = (
-        select(Message.content)
-        .where(Message.conversation_id == Conversation.id)
-        .order_by(Message.id.desc())
-        .limit(1)
-        .correlate(Conversation)
-        .scalar_subquery()
-    )
-    stmt = (
-        select(Conversation, Customer.name, msg_count, last_message)
-        .outerjoin(Customer, Customer.id == Conversation.customer_id)
-        .order_by(Conversation.created_at.desc())
-        .limit(limit)
-    )
-    if before is not None:
-        stmt = stmt.where(Conversation.created_at < before)
-    if customer_id is not None:
-        stmt = stmt.where(Conversation.customer_id == customer_id)
-    async with db.SessionLocal() as session:
-        rows = (await session.execute(stmt)).all()
-    return [
-        ConversationSummary(
-            id=c.id,
-            customer_id=c.customer_id,
-            customer_name=name,
-            created_at=c.created_at,
-            message_count=count or 0,
-            last_message=last,
-        )
-        for c, name, count, last in rows
-    ]
-
-
-@app.get("/api/conversations", response_model=list[ConversationSummary])
-async def list_conversations(
-    limit: int = Query(50, ge=1, le=200),
-    before: datetime | None = Query(None, description="cursor: created_at of last row"),
-    principal: Principal = Depends(require_admin),
-) -> list[ConversationSummary]:
-    return await _conversation_summaries(limit, before, customer_id=principal.scope)
-
-
-def _visible(convo: Conversation | None, principal: Principal) -> bool:
-    return convo is not None and (principal.scope is None or convo.customer_id == principal.scope)
-
-
-@app.get("/api/admin/stats", response_model=AdminStats)
-async def admin_stats(principal: Principal = Depends(require_admin)) -> AdminStats:
-    """Headline numbers for the dashboard (scoped like the conversation list)."""
-
-    def scoped(stmt, conv_col):
-        if principal.scope is None:
-            return stmt
-        owned = select(Conversation.id).where(Conversation.customer_id == principal.scope)
-        return stmt.where(conv_col.in_(owned))
-
-    async with db.SessionLocal() as session:
-        conv_stmt = select(
-            func.count(Conversation.id), func.coalesce(func.sum(Conversation.tokens_used), 0)
-        )
-        if principal.scope is not None:
-            conv_stmt = conv_stmt.where(Conversation.customer_id == principal.scope)
-        conversations, tokens = (await session.execute(conv_stmt)).one()
-        messages = await session.scalar(
-            scoped(select(func.count(Message.id)), Message.conversation_id)
-        )
-        decisions = (
-            await session.execute(
-                scoped(
-                    select(Refund.decision, func.count(Refund.id)).group_by(Refund.decision),
-                    Refund.conversation_id,
-                )
-            )
-        ).all()
-        flags = await session.scalar(
-            scoped(
-                select(func.count(ReasoningEvent.id)).where(
-                    ReasoningEvent.step_type == "injection_flag"
-                ),
-                ReasoningEvent.conversation_id,
-            )
-        )
-    return AdminStats(
-        conversations=conversations or 0,
-        messages=messages or 0,
-        decisions={d: n for d, n in decisions},
-        injection_flags=flags or 0,
-        tokens_used=int(tokens or 0),
-    )
-
-
-@app.get("/api/conversations/{conversation_id}", response_model=ConversationDetail)
-async def get_conversation(
-    conversation_id: str, principal: Principal = Depends(require_admin)
-) -> ConversationDetail:
-    async with db.SessionLocal() as session:
-        convo = await session.get(Conversation, conversation_id)
-        if not _visible(convo, principal):
-            raise HTTPException(status_code=404, detail="conversation not found")
-        name = None
-        if convo.customer_id:
-            cust = await session.get(Customer, convo.customer_id)
-            name = cust.name if cust else None
-        messages = (
-            await session.scalars(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.id)
-            )
-        ).all()
-        events = (
-            await session.scalars(
-                select(ReasoningEvent)
-                .where(ReasoningEvent.conversation_id == conversation_id)
-                .order_by(ReasoningEvent.seq)
-            )
-        ).all()
-    return ConversationDetail(
-        id=convo.id,
-        customer_id=convo.customer_id,
-        customer_name=name,
-        messages=_messages_out(messages),
-        events=[
-            ReasoningEventOut(
-                id=e.id,
-                seq=e.seq,
-                step_type=e.step_type,
-                node=e.node,
-                payload=e.payload,
-                created_at=e.created_at,
-            )
-            for e in events
-        ],
-    )
-
-
-@app.get("/api/conversations/{conversation_id}/stream")
-async def stream_conversation(
-    conversation_id: str, principal: Principal = Depends(require_admin)
-):
-    """Live reasoning events for a conversation (admin dashboard)."""
-    if principal.scope is not None:
-        async with db.SessionLocal() as session:
-            convo = await session.get(Conversation, conversation_id)
-        if not _visible(convo, principal):
-            raise HTTPException(status_code=404, detail="conversation not found")
-
-    async def event_stream():
-        SSE_STREAMS.labels("admin").inc()
-        try:
-            async for event in broadcaster.subscribe(conversation_id):
-                yield {"data": json.dumps(event)}
-        finally:
-            SSE_STREAMS.labels("admin").dec()
-
-    return EventSourceResponse(event_stream(), ping=15)
+@app.get("/{path:path}", include_in_schema=False)
+async def frontend(path: str):
+    if path.startswith("api/"):
+        return JSONResponse({"detail": "Not found."}, status_code=404)
+    if path == "favicon.svg" and (FRONTEND_DIST / path).is_file():
+        return FileResponse(FRONTEND_DIST / path)
+    if not (FRONTEND_DIST / "index.html").is_file():
+        return JSONResponse({"detail": "Build the frontend with npm run build, or use the dev server on port 5173."}, status_code=503)
+    return FileResponse(FRONTEND_DIST / "index.html")
